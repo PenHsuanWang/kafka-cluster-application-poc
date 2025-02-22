@@ -1,0 +1,19 @@
+.app-container {
+  max-width: 600px;
+  margin: 0 auto;
+  font-family: sans-serif;
+}
+
+label {
+  display: inline-block;
+  width: 120px;
+}
+
+form div {
+  margin-bottom: 8px;
+}
+
+button {
+  cursor: pointer;
+  margin-top: 4px;
+}
