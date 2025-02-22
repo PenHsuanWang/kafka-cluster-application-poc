@@ -173,4 +173,233 @@ curl -X POST "http://localhost:8000/stop-all"
 - **Kafka partitioning**: To distribute messages across multiple consumers in the same group, you need multiple partitions on your topic. A single-partition topic can only be consumed by one consumer at a time within the same group.  
 - **Monitoring**: Tools like `kafka-consumer-groups.sh` or external dashboards (e.g., Conduktor, Burrow) can help you track consumer lag and partition assignments.
 
+
 ---
+
+The following summary is a complete lifecycle explanation—from the overall architecture to each thread (including the main thread and worker threads)—designed to let you understand the entire workflow from start to finish.
+
+---
+
+## 1. Overall Operational Architecture
+
+- **Application Starting Point**  
+  In the `if __name__ == "__main__":` block of `server.py`, the following call is made:
+  ```python
+  uvicorn.run(app, host="0.0.0.0", port=8000)
+  ```  
+  This line of code starts the uvicorn server, which in turn launches the FastAPI application. At this point, the main thread enters the asyncio event loop created by uvicorn and remains blocked waiting for external HTTP requests.
+
+- **API Request Dispatching**  
+  When an external request is sent (for example, `/start-consumer`, `/stop-consumer`, etc.), the uvicorn event loop routes the request to the corresponding FastAPI endpoint. The execution of these endpoints (either by a worker thread or as an async coroutine) will call methods in our custom `ThreadManager` to manipulate threads.
+
+---
+
+## 2. Main Thread and the uvicorn Event Loop
+
+- **Main Thread Entering Wait State**  
+  The `run()` method of uvicorn creates and starts an asyncio event loop. Internally, the server calls in `server.run()` (in single-worker mode):
+  ```python
+  asyncio.run(self.serve(sockets=sockets))
+  ```
+  
+  ![Screenshot 2025-02-22 at 5.07.20 PM](https://hackmd.io/_uploads/r1dRmMPcke.png)
+
+  In this process, the `serve()` function further calls `await self._serve(sockets)`. During this process, the server completes its startup, binds the socket, and calls `await self.startup(sockets)`.  
+  Then, the server enters the coroutine `await self.main_loop()`, where the loop waits using `await asyncio.sleep(0.1)` to periodically check if it needs to exit.  
+  In other words, **the main thread primarily waits for new events and requests within the asyncio event loop established by uvicorn (especially at the sleep call in the `main_loop()` coroutine)**.
+
+- **Dispatching API Requests**  
+  When a new HTTP request arrives, the uvicorn event loop immediately dispatches the request to FastAPI for handling, while the main thread (or other workers within the event loop) returns to a waiting state.
+
+---
+
+## 3. Operation Process of ThreadManager and ConsumerThread
+
+### 3.1 When Receiving a `/start-consumer` Request
+
+1. **API Endpoint is Called**  
+   The FastAPI route `/start-consumer` is triggered, and at this time, the thread processing the request (usually from a uvicorn worker or coroutine) executes the `start_consumer()` function.
+
+2. **Calling ThreadManager.start_consumer**  
+   Within this function, a new ConsumerThread object is created based on the passed parameters.  
+   - **Object Instantiation:**  
+     In `ConsumerThread.__init__`, the Kafka broker, topic, file path, group_id, client_id are set, and a `stop_event` is created (used for subsequent stop notifications).
+     
+  ![Screenshot 2025-02-22 at 5.08.42 PM](https://hackmd.io/_uploads/SkkNNfv9Jl.png)
+  
+  ![Screenshot 2025-02-22 at 5.09.22 PM](https://hackmd.io/_uploads/BkZ8VGw5Jl.png)
+
+3. **Starting a New Thread**  
+   Immediately thereafter, `ConsumerThread.start()` is called.  
+   - This call **does not block** the API thread that invoked it; it merely forks a new worker thread within the same process and automatically calls the object's `run()` method.
+
+4. **Responding to the API Request**  
+   The ThreadManager returns the unique consumer_id generated, and the API endpoint returns a JSON response. The main thread or the API handling thread then immediately returns to a waiting state.
+
+---
+
+### 3.2 Lifecycle of ConsumerThread
+
+1. **Instantiation:**  
+   - In `__init__`, basic parameters are set, a `stop_event` is created, and the thread name is configured (if a client_id is provided, it is used as the name).
+
+2. **Start:**  
+   - After calling `start()`, the system creates a new OS thread under the same PID, and this new thread automatically executes the `run()` method.
+
+3. **Running:**  
+   - **Initialize KafkaConsumer:** In the `run()` method, a KafkaConsumer is created and subscribes to the specified topic.  
+   - **Enter Consumption Loop:** The specified file is opened in append mode for writing, and an infinite loop is entered. In each iteration of the loop:  
+     - It checks `self.stop_event.is_set()`: if it has not been set, it continues.  
+     - It consumes a message from Kafka, decodes it, writes it to the file, and then simulates a processing delay with `time.sleep(0.1)`.  
+   - **Exception and Exit:** If a stop signal is received (or an error occurs) in the loop, it breaks out of the loop, closes the KafkaConsumer, and exits the `run()` method.
+
+4. **Stop:**  
+   - When a `/stop-consumer` request is received, the ThreadManager calls `ConsumerThread.stop()`.  
+   - This method sets the `stop_event`, causing the running loop to detect it, exit, and complete cleanup.
+
+5. **Termination:**  
+   - Next, the ThreadManager calls `join()` to wait for the thread to completely exit.  
+   - When the `run()` method ends, the thread officially terminates, the OS releases its resources, and the thread record is removed from the manager’s dictionary.
+
+---
+
+### 3.3 When Receiving a `/stop-consumer` Request
+
+1. **API Endpoint is Called**  
+   The FastAPI route `/stop-consumer/{consumer_id}` is triggered, and the corresponding API handling thread executes `stop_consumer(consumer_id)`.
+
+2. **Calling ThreadManager.stop_consumer**  
+   The manager finds the corresponding ConsumerThread based on the consumer_id.  
+   - It calls `thread.stop()` (to set the stop event).  
+   - It calls `thread.join(timeout=10)`, an operation that will block the API handling thread while waiting for the worker thread to gracefully exit.
+
+3. **Response and Cleanup**  
+   If the thread exits gracefully, it is removed from the management structure and a success response is returned; if it does not exit within the specified time, a warning is issued, but ultimately the API response will return the stop result.
+
+---
+
+## 4. Summary of the Overall Workflow and Lifecycle
+
+1. **Main Thread (uvicorn Event Loop):**  
+   - After `uvicorn.run(app, ...)` is initiated, the main thread creates an asyncio event loop and enters `server.run()`, then enters the `await self.main_loop()` coroutine to continuously wait (for example, at the `await asyncio.sleep(0.1)` call).  
+   - It is responsible for listening for external HTTP requests and dispatching them to the corresponding API handling threads or coroutines.
+
+2. **API Request Handling (FastAPI Endpoint):**  
+   - When a request comes in (for example, to start or stop a consumer), the corresponding API handling function is triggered and calls the ThreadManager from within a worker thread.  
+   - These calls include creating a ConsumerThread (and starting a new thread via `start()`) or stopping a ConsumerThread (using `stop()` and waiting for exit with `join()`).
+
+3. **Lifecycle of ConsumerThread (Worker Thread):**  
+   - **Instantiation:** Setting parameters via `__init__` and creating the stop event.  
+   - **Start:** Calling `start()` forks a new thread within the same process and begins executing the `run()` method.  
+   - **Running:**  
+     - Creating a KafkaConsumer and connecting.  
+     - Entering an endless loop to continuously consume messages while checking for the stop event.  
+     - Writing messages to a file and waiting (sleep).  
+   - **Stop:** Upon receiving an external stop command, the `stop()` method is called to set the stop event, causing the loop to exit.  
+   - **Termination:** Calling `join()` to wait for the thread to exit, after which it is removed from the management structure and the OS reclaims the thread’s resources.
+
+---
+
+This entire process ensures that:  
+- The main thread always waits for new requests in uvicorn's asyncio event loop and is not blocked by the newly started ConsumerThread (unless the API handling logic includes synchronous calls such as join).  
+- When an API request arrives, FastAPI dynamically manages worker threads through the ThreadManager, handling start, stop, and status queries accordingly.  
+- Each ConsumerThread—from instantiation and starting, to continuous running, and finally to receiving a stop signal and gracefully exiting—constitutes a complete thread lifecycle.
+
+This is the complete explanation of every stage, from the main thread to the worker threads, and through the entire application workflow.
+
+Below is a simple ASCII flowchart that simulates the complete process from the main process (PID) starting uvicorn (i.e., the main thread), to forking out a ConsumerThread upon receiving the start-consumer command, and then stopping the thread upon receiving the stop-consumer command:
+
+```
+┌─────────────────────────────────────────┐
+│                Process (PID)            │
+│                                         │
+│  ┌─────────────────────────────────────┐  │
+│  │           Main Thread               │  │
+│  │ (uvicorn/ubicomp Event Loop)        │  │
+│  │   ┌─────────────────────────────┐   │  │
+│  │   │Waiting and Dispatching HTTP │◄──┼─────┐
+│  │   │ Requests (API)              │   │     │
+│  │   └─────────────────────────────┘   │     │
+│  └─────────────────────────────────────┘     │
+└─────────────────────────────────────────┘     │
+                                              │   │
+                                              │   │
+                             ┌────────────────┴───┴─────────────┐
+                             │        API Command Received      │
+                             │       (e.g., start-consumer)       │
+                             └────────────────┬────────────────────┘
+                                              │
+                                              ▼
+                    ┌────────────────────────────────────────┐
+                    │      ThreadManager.start_consumer      │
+                    │  ──> Generate consumer_id              │
+                    │  ──> Create ConsumerThread object       │
+                    │  ──> Call thread.start()                │
+                    └────────────────────────────────────────┘
+                                              │
+                                              ▼
+                    ┌────────────────────────────────────────┐
+                    │           ConsumerThread               │
+                    │   ┌────────────────────────────────┐   │
+                    │   │        Life Cycle:             │   │
+                    │   │ __init__ (set parameters and   │   │
+                    │   │       stop_event)              │   │
+                    │   │      ↓                       │   │
+                    │   │  start() → New thread created  │   │
+                    │   │      ↓                       │   │
+                    │   │  run() execution starts:       │   │
+                    │   │      ┌────────────────────┐    │   │
+                    │   │      │ Create KafkaConsumer│    │   │
+                    │   │      │ Enter consumption   │    │   │
+                    │   │      │ loop (continuously    │    │   │
+                    │   │      │ consuming messages)   │    │   │
+                    │   │      └────────────────────┘    │   │
+                    │   └────────────────────────────────┘   │
+                    └────────────────────────────────────────┘
+                                              │
+                                              │
+                                              │
+                        ┌─────────────────────┴────────────────────────┐
+                        │      API Command Received: stop-consumer     │
+                        │     (corresponding to ThreadManager.stop_consumer)│
+                        └─────────────────────┬────────────────────────┘
+                                              │
+                                              ▼
+                    ┌────────────────────────────────────────┐
+                    │      ConsumerThread.stop() is called   │
+                    │   (set stop_event, notify loop to exit)  │
+                    └────────────────────────────────────────┘
+                                              │
+                                              ▼
+                    ┌────────────────────────────────────────┐
+                    │ Call thread.join() in the API handling │
+                    │ thread to wait for ConsumerThread’s    │
+                    │        graceful exit                   │
+                    └────────────────────────────────────────┘
+                                              │
+                                              ▼
+                    ┌────────────────────────────────────────┐
+                    │ ConsumerThread completes run() and     │
+                    │   terminates (OS releases thread       │
+                    │   resources, manager removes record)   │
+                    └────────────────────────────────────────┘
+```
+
+---
+
+### Explanation
+
+1. **Main Thread**  
+   • Starting from time 0, the main thread is continuously waiting for and processing HTTP requests in the uvicorn event loop.  
+   • At 5 seconds, upon receiving the start-consumer API request, the main thread calls `start_consumer` via the ThreadManager, forking a new ConsumerThread (this process does not block the main thread).
+
+2. **ConsumerThread**  
+   • Once forked, it immediately enters its own `run()` method, creates a KafkaConsumer, and enters a continuous loop for consuming messages.  
+   • During this period, the ConsumerThread operates concurrently with the main thread.
+
+3. **Stopping ConsumerThread**  
+   • At 15 seconds, upon receiving the stop-consumer API request, the main thread (or the API handling thread) calls the ThreadManager’s `stop_consumer`, which in turn calls ConsumerThread’s `stop()` (setting the stop event).  
+   • Then, `join()` is called to wait for the ConsumerThread to gracefully exit.  
+   • Once ConsumerThread detects that the stop_event is set, it exits the loop, completes cleanup, and terminates. At this point, `join()` returns, and the ConsumerThread has completely exited with its resources released.
+
+
