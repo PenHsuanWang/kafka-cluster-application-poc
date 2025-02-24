@@ -9,6 +9,7 @@ from consumers.manager import ThreadManager
 
 logger = logging.getLogger(__name__)
 
+
 # Request model to create a consumer
 class CreateConsumerRequest(BaseModel):
     name: str
@@ -18,9 +19,11 @@ class CreateConsumerRequest(BaseModel):
     group_id: Optional[str] = "demo-consumer-group"
     auto_start: bool = True
 
+
 # Request model to identify a consumer by ID
 class ConsumerControlRequest(BaseModel):
     consumer_id: str
+
 
 app = FastAPI()
 
@@ -34,26 +37,35 @@ app.add_middleware(
 
 manager = ThreadManager()
 
+
 @app.post("/create-consumer")
 def create_consumer(req: CreateConsumerRequest):
     """
     Create a new consumer record. If auto_start=True, it starts immediately (RUNNING).
     Otherwise, it remains CREATED until you call /start-consumer.
+    If the Kafka broker is unreachable, an exception from manager.create_consumer
+    will bubble up. We catch it here and return an HTTP 400 error.
     """
-    consumer_id = manager.create_consumer(
-        consumer_name=req.name,
-        broker=req.broker,
-        topic=req.topic,
-        file_path=req.file_path,
-        group_id=req.group_id or "demo-consumer-group",
-        auto_start=req.auto_start
-    )
-    return {
-        "message": "Consumer created",
-        "consumer_id": consumer_id,
-        "consumer_name": req.name,
-        "auto_start": req.auto_start
-    }
+    try:
+        consumer_id = manager.create_consumer(
+            consumer_name=req.name,
+            broker=req.broker,
+            topic=req.topic,
+            file_path=req.file_path,
+            group_id=req.group_id or "demo-consumer-group",
+            auto_start=req.auto_start
+        )
+        return {
+            "message": "Consumer created",
+            "consumer_id": consumer_id,
+            "consumer_name": req.name,
+            "auto_start": req.auto_start
+        }
+    except Exception as e:
+        # We can log the error and raise HTTP 400 or 500, depending on your preference
+        logger.error(f"Failed to create consumer: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/start-consumer")
 def start_consumer(control: ConsumerControlRequest):
@@ -65,6 +77,7 @@ def start_consumer(control: ConsumerControlRequest):
         raise HTTPException(status_code=404, detail="Cannot start consumer.")
     return {"message": f"Consumer {control.consumer_id} started/resumed."}
 
+
 @app.post("/pause-consumer")
 def pause_consumer(control: ConsumerControlRequest):
     """
@@ -74,6 +87,7 @@ def pause_consumer(control: ConsumerControlRequest):
     if not success:
         raise HTTPException(status_code=404, detail="Cannot pause consumer.")
     return {"message": f"Consumer {control.consumer_id} paused."}
+
 
 @app.post("/terminate-consumer")
 def terminate_consumer(control: ConsumerControlRequest):
@@ -85,12 +99,14 @@ def terminate_consumer(control: ConsumerControlRequest):
         raise HTTPException(status_code=404, detail="Cannot terminate consumer.")
     return {"message": f"Consumer {control.consumer_id} terminated."}
 
+
 @app.get("/list-consumers")
 def list_consumers():
     """
     Return metadata about all consumers.
     """
     return manager.list_consumers()
+
 
 @app.get("/monitor-threads")
 def monitor_threads():
@@ -100,10 +116,12 @@ def monitor_threads():
     """
     return manager.monitor_threads()
 
+
 @app.on_event("shutdown")
 def shutdown_event():
     logger.info("Shutting down. Terminating all consumers.")
     manager.stop_all()
+
 
 if __name__ == "__main__":
     import uvicorn

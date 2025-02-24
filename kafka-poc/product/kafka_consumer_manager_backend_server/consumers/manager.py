@@ -7,6 +7,7 @@ from .consumer_thread import ConsumerThread
 
 logger = logging.getLogger(__name__)
 
+
 class ThreadManager:
     """
     Manages multiple Kafka consumer threads. Each consumer has a status:
@@ -39,6 +40,8 @@ class ThreadManager:
     ) -> str:
         """
         Create a consumer record. If auto_start=True, we also start the thread.
+        Then we wait for the thread to finish initial broker connection.
+        If it fails, we raise the exception so the server can return an error.
         """
         consumer_id = str(uuid.uuid4())
         thread = ConsumerThread(
@@ -63,7 +66,19 @@ class ThreadManager:
         logger.info(f"Created consumer '{consumer_name}' (ID={consumer_id}), status=CREATED")
 
         if auto_start:
-            self.start_consumer(consumer_id)
+            # Start the thread
+            started_ok = self.start_consumer(consumer_id)
+            if not started_ok:
+                # If start_consumer returned False, something else is wrong
+                raise RuntimeError(f"Could not start consumer {consumer_id}")
+
+            # Now wait for the thread to do its initial connect
+            thread.init_done.wait(timeout=5)  # wait up to 5s for initial connect
+            if thread.init_error is not None:
+                # Remove from dictionary so we don't keep a broken record
+                del self._consumers[consumer_id]
+                # Raise the original exception so the server can bubble it up
+                raise thread.init_error
 
         return consumer_id
 
@@ -175,16 +190,12 @@ class ThreadManager:
         }
 
     def monitor_threads(self) -> List[Dict[str, Any]]:
-        """
-        Return a summary of all active threads in Python,
-        plus a note about whether they're recognized in the manager.
-        """
-        active = threading.enumerate()  # list of Thread objects
+        active = threading.enumerate()
         results = []
 
         # Convert your manager’s dict to a set of threads for quick lookup
         manager_threads = set(
-            record["thread"] for record in self._consumers.values()
+            rec["thread"] for rec in self._consumers.values()
         )
 
         for th in active:

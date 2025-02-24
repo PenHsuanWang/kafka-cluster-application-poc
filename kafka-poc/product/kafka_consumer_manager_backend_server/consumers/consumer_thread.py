@@ -9,6 +9,7 @@ class ConsumerThread(threading.Thread):
     """
     A thread that continuously consumes messages from a Kafka topic
     and writes them to a file, with support for pausing and stopping.
+    Also uses init_done and init_error to propagate startup exceptions.
     """
 
     def __init__(
@@ -31,6 +32,10 @@ class ConsumerThread(threading.Thread):
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
 
+        # For startup error propagation:
+        self.init_done = threading.Event()
+        self.init_error = None
+
     def run(self):
         logger.info(f"[{self.name}] Creating KafkaConsumer: broker={self.broker}, topic={self.topic}")
         try:
@@ -42,10 +47,16 @@ class ConsumerThread(threading.Thread):
                 group_id=self.group_id,
                 client_id=self.client_id or f"python-consumer-{id(self)}"
             )
+            # If we got here, the consumer connected successfully
+            self.init_done.set()
         except Exception as e:
             logger.error(f"[{self.name}] Failed to create consumer: {e}", exc_info=True)
-            return
+            self.init_error = e
+            # Signal main thread that startup failed
+            self.init_done.set()
+            return  # stop run() here
 
+        # Normal consumption flow if init succeeded
         with open(self.file_path, 'a') as file:
             logger.info(f"[{self.name}] Starting consumption on topic={self.topic}")
             try:
