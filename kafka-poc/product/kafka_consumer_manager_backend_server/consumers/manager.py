@@ -1,5 +1,6 @@
 import uuid
 import logging
+import threading
 from typing import Dict, Any, List
 
 from .consumer_thread import ConsumerThread
@@ -172,3 +173,27 @@ class ThreadManager:
             "group_id": record["group_id"],
             "status": record["status"]
         }
+
+    def monitor_threads(self) -> List[Dict[str, Any]]:
+        """
+        Return a summary of all active threads in Python,
+        plus a note about whether they're recognized in the manager.
+        """
+        active = threading.enumerate()  # list of Thread objects
+        results = []
+
+        # Convert your manager’s dict to a set of threads for quick lookup
+        manager_threads = set(
+            record["thread"] for record in self._consumers.values()
+        )
+
+        for th in active:
+            # Check if it's one of your ConsumerThreads or a system thread
+            is_consumer = (th in manager_threads)
+            results.append({
+                "thread_name": th.name,
+                "is_consumer": is_consumer,
+                "alive": th.is_alive()
+            })
+
+        return results

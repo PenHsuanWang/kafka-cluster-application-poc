@@ -92,6 +92,14 @@ def list_consumers():
     """
     return manager.list_consumers()
 
+@app.get("/monitor-threads")
+def monitor_threads():
+    """
+    Return a summary of all active threads (including system threads),
+    and whether each one is recognized in the manager.
+    """
+    return manager.monitor_threads()
+
 @app.on_event("shutdown")
 def shutdown_event():
     logger.info("Shutting down. Terminating all consumers.")
